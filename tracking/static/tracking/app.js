@@ -1,4 +1,4 @@
-/* Shared helpers for the Meltice Fleet prototype UI */
+/* Shared helpers for the Meltice GPS Tracker UI */
 (function () {
   const cfg = window.FLEET_CFG || {tz: "Asia/Dubai", poll: 5};
   const dtf = new Intl.DateTimeFormat("en-GB", {timeZone: cfg.tz, year: "numeric", month: "2-digit", day: "2-digit",
@@ -39,6 +39,29 @@
       L.control.layers({"Map": streets, "Satellite": sat}, {}, {position: "topright"}).addTo(map);
     },
   };
+
+  // light / dark / match-system theme (applied early by an inline script in base.html)
+  const media = window.matchMedia ? matchMedia("(prefers-color-scheme: dark)") : null;
+  const ICON = {light: "bi-sun", dark: "bi-moon-stars", auto: "bi-circle-half"};
+  function applyTheme(pref) {
+    const dark = pref === "dark" || (pref === "auto" && media && media.matches);
+    document.documentElement.setAttribute("data-bs-theme", dark ? "dark" : "light");
+    document.documentElement.dataset.themePref = pref;
+    document.querySelectorAll("[data-theme-icon]").forEach(i => { i.className = "bi " + ICON[pref]; });
+    document.querySelectorAll("[data-theme-set]").forEach(b => b.classList.toggle("active", b.dataset.themeSet === pref));
+    document.dispatchEvent(new CustomEvent("themechange", {detail: {dark}}));
+  }
+  F.theme = () => document.documentElement.getAttribute("data-bs-theme");
+  document.addEventListener("click", e => {
+    const b = e.target.closest("[data-theme-set]");
+    if (!b) return;
+    try { localStorage.setItem("mgt-theme", b.dataset.themeSet); } catch (err) { /* private mode */ }
+    applyTheme(b.dataset.themeSet);
+  });
+  if (media && media.addEventListener) media.addEventListener("change", () => {
+    if ((document.documentElement.dataset.themePref || "auto") === "auto") applyTheme("auto");
+  });
+  applyTheme(document.documentElement.dataset.themePref || "auto");
 
   // clock + receiver pill
   const clock = document.getElementById("uaeClock");

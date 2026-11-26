@@ -4,6 +4,9 @@ Target: `https://fleet.melticetech.com` for the web UI and `gps.melticetech.com:
 
 > **Plan requirement:** a Hostinger **VPS** (KVM 1 or larger, Ubuntu 22.04/24.04). Shared/Cloud/WordPress
 > hosting only serves HTTP(S) and cannot accept the tracker's raw TCP connection on port 5027.
+> The database is **Microsoft SQL Server**. By default the installer runs SQL Server 2022 **Express**
+> (free for production, 10 GB per database) in Docker on the VPS, listening on `127.0.0.1:1433` only.
+> It needs about 2 GB of RAM; KVM 1 (4 GB) is enough.
 
 Two ways to run it on the VPS — pick one:
 
@@ -38,26 +41,33 @@ Check from your PC: `nslookup gps.melticetech.com` → VPS IP.
 
 ## 2. Upload the code
 
-From your PC: `scp meltice-gps-tracker.zip root@<VPS-IP>:/root/` then on the VPS:
+On the VPS:
 
 ```bash
-apt-get install -y unzip && cd /root && unzip -o meltice-gps-tracker.zip && cd meltice-gps-tracker
+cd /root && git clone https://github.com/connectbishar-byte/meltice-gps-tracker.git && cd meltice-gps-tracker
 ```
 
-(or `git clone` once the code is in GitHub.)
+(Private repository: use a GitHub deploy key or a fine-grained personal access token with read access.)
 
 ## 3a. Install — native (B1)
 
 ```bash
 sudo bash deploy/hostinger/install.sh
-# optional overrides: WEB_DOMAIN=fleet.example.com GPS_DOMAIN=gps.example.com DB_EXTRA=mssql sudo -E bash deploy/hostinger/install.sh
+# other domains:          sudo WEB_DOMAIN=fleet.example.com GPS_DOMAIN=gps.example.com bash deploy/hostinger/install.sh
+# existing SQL Server:    sudo DB_MODE=external DB_HOST=10.0.0.5 DB_NAME=meltice_gps_tracker DB_USER=fleet_app \
+#                              DB_PASSWORD='...' [DB_ADMIN_USER=sa DB_ADMIN_PASSWORD='...'] bash deploy/hostinger/install.sh
 ```
 
 The script prints the generated **admin password** — save it. It creates:
 
 * service account `fleet`, code in `/srv/meltice-gps-tracker/app`, virtualenv `/srv/meltice-gps-tracker/venv`
-* config `/etc/meltice-gps-tracker/fleet.env` (root:fleet, 640) with a random `FLEET_SECRET_KEY`
-* SQLite DB `/var/lib/meltice-gps-tracker/fleet.sqlite3`, logs `/var/log/meltice-gps-tracker/{web,receiver}.log`
+* config `/etc/meltice-gps-tracker/fleet.env` (root:fleet, 640) with a random `FLEET_SECRET_KEY` and app DB password
+* Microsoft ODBC Driver 18 for SQL Server
+* SQL Server 2022 Express container `meltice-mssql` (`--restart unless-stopped`, `127.0.0.1:1433`), data in
+  `/var/opt/meltice-mssql`, `sa` password in `/etc/meltice-gps-tracker/mssql.env` (root only, 600)
+* database `meltice_gps_tracker` and login `fleet_app` (db_owner of that database only, no server rights);
+  the app never uses `sa`
+* logs `/var/log/meltice-gps-tracker/{web,receiver}.log`
 * systemd units `gunicorn-fleet` (127.0.0.1:9040) and `fleet-receiver` (0.0.0.0:5027)
 * a **new** Nginx site for `fleet.melticetech.com` only (other sites untouched; `nginx -t` before reload)
 * the self-test IMEI `356307042441013` on the allow-list (disable it in *Devices* after testing)
@@ -71,7 +81,8 @@ Re-running is safe (keeps `fleet.env` and data). Upgrades: unpack the new releas
 
 ```bash
 curl -fsSL https://get.docker.com | sh            # if Docker is not installed (Hostinger also has a Docker VPS template)
-cp .env.example .env && nano .env                 # set FLEET_SECRET_KEY, FLEET_ADMIN_PASSWORD, FLEET_PUBLIC_GPS_HOST=gps.melticetech.com
+cp .env.example .env && nano .env                 # set FLEET_SECRET_KEY, FLEET_ADMIN_PASSWORD, MSSQL_SA_PASSWORD,
+                                                  # FLEET_DB_PASSWORD, FLEET_PUBLIC_GPS_HOST=gps.melticetech.com
 docker compose -f docker-compose.yml -f deploy/hostinger/docker-compose.hostinger.yml up -d --build
 sudo cp deploy/hostinger/nginx-fleet.melticetech.com.conf /etc/nginx/sites-available/fleet.melticetech.com
 sudo ln -s /etc/nginx/sites-available/fleet.melticetech.com /etc/nginx/sites-enabled/
@@ -112,8 +123,10 @@ Test-NetConnection gps.melticetech.com -Port 5027
 python tools\fmc_probe.py gps.melticetech.com 5027
 ```
 
-Then log in at `https://fleet.melticetech.com`, open **Connectivity** — the probe's test run and
-connections appear there — and **Live map** shows the probe's test point.
+Then log in at `https://fleet.melticetech.com` and open **Port terminal**: the probe's connections, every byte
+it sent, the server's replies and the decoded frames appear there live. **Connectivity** lists the connections
+and **Live map** shows the probe's test point. Over SSH, `manage.py port_monitor` shows the same stream
+(see README).
 
 Finally re-check every other site/application on the VPS still works (scope: *Regression*).
 
@@ -126,40 +139,38 @@ ACK `AVL`, TLS `None` (controlled test only). Register the device's IMEI on the 
 Optional packet capture while testing (contains location data — keep it short, delete after):
 `sudo tcpdump -ni any tcp port 5027 -c 50`
 
-## 7. Database options
+## 7. Database (SQL Server)
 
-SQLite is the default and is fine for a single-device trial (WAL mode, one writer thread).
+| | Default (`DB_MODE=docker`) | `DB_MODE=external` |
+|---|---|---|
+| Server | SQL Server 2022 Express in Docker on this VPS | your existing SQL Server 2019/2022 |
+| Address | `127.0.0.1:1433` (not reachable from the internet) | `DB_HOST:DB_PORT`, private network / VPN |
+| Created by | `install_sqlserver.sh` + `manage.py mssql_setup` | `mssql_setup` when `DB_ADMIN_PASSWORD` is given, else you create DB + login |
 
-**SQL Server (scope's planned VPS database).** Needs ≥ 2 GB RAM if installed on the same VPS, or use an
-existing SQL Server reachable privately.
+Useful commands on the VPS:
 
 ```bash
-# Microsoft ODBC driver 18 (Ubuntu) — follow https://learn.microsoft.com/sql/connect/odbc/linux-mac/installing-the-microsoft-odbc-driver-for-sql-server
-sudo ACCEPT_EULA=Y apt-get install -y msodbcsql18 unixodbc-dev
-sudo -u fleet /srv/meltice-gps-tracker/venv/bin/pip install -r /srv/meltice-gps-tracker/app/requirements-mssql.txt
+sudo docker logs --tail 50 meltice-mssql                       # SQL Server log
+sudo docker exec -it meltice-mssql /opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa \
+     -P "$(sudo grep MSSQL_SA_PASSWORD /etc/meltice-gps-tracker/mssql.env | cut -d= -f2-)"   # sa console
 ```
 
-In SQL Server create database `meltice_gps_tracker` and a least-privilege login (db_owner on that DB only
-for migrations). Then in `/etc/meltice-gps-tracker/fleet.env`:
+Connect from your PC with SSMS / Azure Data Studio through an SSH tunnel (port 1433 stays closed):
+`ssh -L 1433:127.0.0.1:1433 root@<VPS-IP>` then connect to `127.0.0.1,1433`, login `fleet_app`
+(password in `/etc/meltice-gps-tracker/fleet.env`), *Trust server certificate*.
 
-```
-FLEET_DB_ENGINE=mssql
-FLEET_DB_NAME=meltice_gps_tracker
-FLEET_DB_USER=fleet_app
-FLEET_DB_PASSWORD=...
-FLEET_DB_HOST=127.0.0.1
-FLEET_DB_PORT=1433
-```
+Never open 1433 in UFW or the hPanel firewall. `FLEET_DB_EXTRA=TrustServerCertificate=yes` is right for the
+local Docker server; for a remote server with a proper certificate use `Encrypt=yes`.
 
-and run `migrate`, then restart both services. Keep port 1433 closed to the internet. Confirm the
-installed `mssql-django` release supports the Django version in `requirements.txt` before switching;
-this prototype was verified end-to-end on SQLite. PostgreSQL works the same way
-(`requirements-postgres.txt`, `FLEET_DB_ENGINE=postgres`).
+Quick trial without SQL Server: `sudo DB_MODE=sqlite bash deploy/hostinger/install.sh`.
 
 ## 8. Operations
 
 * Backups: `sudo crontab -e` → `15 2 * * * bash /srv/meltice-gps-tracker/app/deploy/hostinger/backup.sh`
-  (SQLite online backup + env, 14-day retention in `/var/backups/meltice-gps-tracker`).
+  (SQL Server full `.bak` in `/var/backups/meltice-gps-tracker/mssql` + env file, 14-day retention).
+  Restore: `RESTORE DATABASE meltice_gps_tracker FROM DISK = '/var/opt/mssql/backup/<file>.bak' WITH REPLACE`
+  in the sa console, with both services stopped.
+* Port terminal events are pruned automatically after `FLEET_PORT_LOG_RETENTION_HOURS` (72 h).
 * Logs rotate automatically (5 × 5 MB per process) and also go to `journalctl`.
 * Change the admin password after first login (`/admin/` → Users).
 
@@ -169,6 +180,7 @@ this prototype was verified end-to-end on SQLite. PostgreSQL works the same way
 sudo systemctl disable --now fleet-receiver gunicorn-fleet
 sudo rm /etc/nginx/sites-enabled/fleet.melticetech.com && sudo nginx -t && sudo systemctl reload nginx
 sudo ufw delete allow 5027/tcp          # if you added it
+sudo docker stop meltice-mssql          # SQL Server (data stays in /var/opt/meltice-mssql)
 # remove the gps/fleet DNS records if no longer needed; restore the device's previous Configurator file
 ```
 
@@ -183,4 +195,6 @@ Data stays in `/var/lib/meltice-gps-tracker` until you delete it.
 | UFW / hPanel firewall | `sudo ufw status`, hPanel firewall rules |
 | DNS-only for `gps`? | `nslookup gps.melticetech.com` must return the VPS IP, not a Cloudflare IP |
 | Reachable from outside? | `python tools/fmc_probe.py gps.melticetech.com 5027` from a non-VPS network |
-| IMEI accepted? | *Connectivity* page → rejected handshakes |
+| IMEI accepted? | *Port terminal* → `IMEI` line says accepted / rejected |
+| Anything arriving at all? | *Port terminal* → `CONN` / `RX` lines (also shows scanners and wrong protocols) |
+| Database reachable? | `sudo docker ps` (meltice-mssql Up), `journalctl -u gunicorn-fleet -n 50` |

@@ -42,6 +42,8 @@ class Receiver:
         self.started = timezone.now()
         self._recent: dict[str, collections.deque] = collections.defaultdict(collections.deque)
         self.server: asyncio.base_events.Server | None = None
+        self.port_log = cfg.get("PORT_LOG", True)
+        self.event_retention_hours = cfg.get("PORT_LOG_RETENTION_HOURS", 72)
 
     # -- helpers ---------------------------------------------------------
     async def run_db(self, fn, *args):
@@ -49,6 +51,27 @@ class Receiver:
             close_old_connections()
             return fn(*args)
         return await asyncio.get_running_loop().run_in_executor(self.db, job)
+
+    def event(self, kind: str, remote: str, *, level: str = "info", imei: str = "", conn_id=None,
+              packet_id=None, data: bytes = b"", message: str = "", size: int | None = None) -> None:
+        """Queue a port-terminal event. Fire-and-forget on the single DB thread, so order is preserved
+        and an event never delays an ACK beyond the queue position it was written in."""
+        if not self.port_log:
+            return
+        ev = dict(ts=timezone.now(), kind=kind, level=level, remote=remote, imei=imei or "",
+                  connection_id=conn_id, packet_id=packet_id or None, data=bytes(data), message=message[:300])
+        if size is not None:
+            ev["size"] = size
+
+        def job():
+            close_old_connections()
+            ingest.write_event(ev)
+        asyncio.get_running_loop().run_in_executor(self.db, job)
+
+    async def send(self, writer, data: bytes, remote: str, imei: str, conn_id, message: str):
+        writer.write(data)
+        await writer.drain()
+        self.event("tx", remote, imei=imei, conn_id=conn_id, data=data, message=message)
 
     def _rate_limited(self, ip: str) -> bool:
         now = time.monotonic()
@@ -91,11 +114,17 @@ class Receiver:
                               active_connections=self.active, total_connections=self.total,
                               frames_ok=self.frames_ok, frames_bad=self.frames_bad, pid=os.getpid()),
             )
+        loops = 0
         while True:
             try:
                 await self.run_db(beat)
+                if loops % 120 == 0:  # every ~10 minutes
+                    n = await self.run_db(ingest.prune_events, self.event_retention_hours)
+                    if n:
+                        log.info("pruned %d port events older than %d h", n, self.event_retention_hours)
             except Exception:
                 log.exception("heartbeat failed")
+            loops += 1
             await asyncio.sleep(5)
 
     # -- connection handler ----------------------------------------------
@@ -113,12 +142,18 @@ class Receiver:
 
         if self.active >= self.max_connections or self._rate_limited(ip):
             log.warning("refusing %s (limit reached)", remote)
+            self.event("refused", remote, level="warn",
+                       message="Connection refused: connection limit or per-IP rate limit reached")
             writer.close()
             return
         self.active += 1
         self.total += 1
         conn_id = None
+        imei = ""
+        frames = 0
+        opened = time.monotonic()
         reason = "closed"
+        self.event("connect", remote, message=f"TCP connection opened ({source}) · {self.active} active")
         try:
             # ---- handshake: 2-byte length + IMEI
             buf = bytearray()
@@ -134,8 +169,10 @@ class Receiver:
                         raise asyncio.TimeoutError
                     chunk = await asyncio.wait_for(reader.read(4096), remaining)
                     if not chunk:
+                        reason = "closed before sending an IMEI"
                         await self.run_db(ingest.log_invalid_handshake, remote, "closed before IMEI", source)
                         return
+                    self.event("rx", remote, data=chunk, message="handshake bytes")
                     buf += chunk
                     if len(buf) > 64:
                         raise codec.ProtocolError("oversized handshake")
@@ -143,12 +180,13 @@ class Receiver:
             conn_id, device_id, accepted = await self.run_db(ingest.open_connection, remote, imei, source)
             if not accepted:
                 log.warning("rejected unknown/disabled IMEI %s from %s", imei, remote)
-                writer.write(b"\x00")
-                await writer.drain()
+                self.event("imei", remote, level="warn", imei=imei, conn_id=conn_id,
+                           message=f"IMEI {imei} is not registered or is disabled: rejecting")
+                await self.send(writer, b"\x00", remote, imei, conn_id, "handshake reply 00 (rejected)")
                 reason = "IMEI not registered or disabled"
                 return
-            writer.write(b"\x01")
-            await writer.drain()
+            self.event("imei", remote, level="ok", imei=imei, conn_id=conn_id, message=f"IMEI {imei} accepted")
+            await self.send(writer, b"\x01", remote, imei, conn_id, "handshake reply 01 (accepted)")
             log.info("accepted IMEI %s from %s", imei, remote)
 
             # ---- AVL frames (handles fragmented and coalesced TCP reads)
@@ -160,12 +198,15 @@ class Receiver:
                     if not chunk:
                         reason = "device closed connection"
                         return
+                    self.event("rx", remote, imei=imei, conn_id=conn_id, data=chunk)
                     buf += chunk
                     continue
                 except codec.ProtocolError as exc:
                     # framing is lost: audit what we have and drop the link
                     self.frames_bad += 1
-                    await self.run_db(ingest.store_bad_frame, conn_id, device_id, bytes(buf[: self.max_frame]), str(exc))
+                    pid = await self.run_db(ingest.store_bad_frame, conn_id, device_id, bytes(buf[: self.max_frame]), str(exc))
+                    self.event("error", remote, level="error", imei=imei, conn_id=conn_id, packet_id=pid,
+                               message=f"Framing error, dropping connection: {exc}")
                     reason = f"framing error: {exc}"
                     return
                 del buf[:used]
@@ -176,11 +217,20 @@ class Receiver:
                     # DB failure -> NO acknowledgement; device keeps the data and resends later
                     self.frames_bad += 1
                     log.error("ingest failed, not acknowledging: %s", exc)
-                    await self.run_db(ingest.store_bad_frame, conn_id, device_id, frame, f"DB/ingest failure, not ACKed: {exc}")
+                    pid = await self.run_db(ingest.store_bad_frame, conn_id, device_id, frame, f"DB/ingest failure, not ACKed: {exc}")
+                    self.event("error", remote, level="error", imei=imei, conn_id=conn_id, packet_id=pid,
+                               message=f"Database/ingest failure, NOT acknowledged (device will resend): {exc}")
                     reason = f"ingest failure: {exc}"
                     return
-                writer.write(codec.encode_ack(result.ack))
-                await writer.drain()
+                frames += 1
+                if result.error:
+                    self.event("frame", remote, level="error", imei=imei, conn_id=conn_id, packet_id=result.packet_id,
+                               size=len(frame), message=f"Invalid frame: {result.error}")
+                else:
+                    self.event("frame", remote, level="ok", imei=imei, conn_id=conn_id, packet_id=result.packet_id,
+                               size=len(frame), message=result.summary)
+                await self.send(writer, codec.encode_ack(result.ack), remote, imei, conn_id,
+                                f"ACK {result.ack}" + (" (rejected, device will resend)" if result.error else ""))
                 if result.error:
                     self.frames_bad += 1
                     await self.run_db(ingest.mark_ack, result.packet_id, "nack", result.ack)
@@ -191,17 +241,29 @@ class Receiver:
                     log.info("IMEI %s: %d records (%d new, %d dup) ACK %d",
                              imei, result.records, result.new, result.duplicates, result.ack)
         except asyncio.TimeoutError:
-            reason = "read timeout"
+            reason = "read timeout" if conn_id is not None else "no IMEI received within the handshake timeout"
             if conn_id is None:
                 await self.run_db(ingest.log_invalid_handshake, remote, "handshake timeout", source)
         except codec.ProtocolError as exc:
             reason = f"protocol error: {exc}"
+            hint = ""
+            if conn_id is None and buf:
+                head = bytes(buf[:40])
+                if all(32 <= b < 127 or b in (9, 10, 13) for b in head):
+                    text = head.decode("ascii", "replace").splitlines()[0][:40] if head.strip() else ""
+                    hint = f" · data is plain text (\"{text}\"): a browser, scanner or wrong device protocol, not a Teltonika tracker"
+            self.event("error", remote, level="error", imei=imei or "", conn_id=conn_id,
+                       message=f"Not a valid Teltonika handshake/frame: {exc}{hint}")
             if conn_id is None:
                 await self.run_db(ingest.log_invalid_handshake, remote, str(exc), source)
         except (ConnectionError, OSError) as exc:
             reason = f"socket error: {exc}"
         finally:
             self.active -= 1
+            secs = time.monotonic() - opened
+            self.event("close", remote, level="warn" if reason not in ("device closed connection",) else "info",
+                       imei=imei, conn_id=conn_id,
+                       message=f"Connection closed: {reason} · {secs:.1f} s · {frames} frame(s) · {self.active} active")
             if conn_id is not None:
                 try:
                     await self.run_db(ingest.close_connection, conn_id, reason)

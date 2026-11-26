@@ -9,6 +9,7 @@ chown -R fleet:fleet "$APP"
 run() { sudo -u fleet bash -c "set -a; source $ENVF; set +a; cd $APP; $VENV/bin/python manage.py $*"; }
 sudo -u fleet "$VENV/bin/pip" install -q -r "$APP/requirements.txt"
 run migrate --noinput
+run createcachetable
 run collectstatic --noinput -v0
 systemctl restart gunicorn-fleet fleet-receiver
 systemctl --no-pager status gunicorn-fleet fleet-receiver | grep -E "Active"

@@ -1,6 +1,6 @@
 from django.contrib import admin
 
-from .models import AVLRecord, Connection, Device, IOValue, RawPacket, ReceiverHeartbeat, TestRun
+from .models import AVLRecord, Connection, Device, IOValue, RawPacket, ReceiverHeartbeat, TestRun, PortEvent
 
 
 @admin.register(Device)
@@ -36,3 +36,11 @@ class AVLRecordAdmin(admin.ModelAdmin):
 
 admin.site.register(ReceiverHeartbeat)
 admin.site.register(TestRun)
+
+
+@admin.register(PortEvent)
+class PortEventAdmin(admin.ModelAdmin):
+    list_display = ("id", "ts", "kind", "level", "remote", "imei", "size", "message")
+    list_filter = ("kind", "level")
+    search_fields = ("imei", "remote", "message", "hex")
+    readonly_fields = [f.name for f in PortEvent._meta.fields]

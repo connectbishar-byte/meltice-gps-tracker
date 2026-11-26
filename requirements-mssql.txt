@@ -1,4 +1,2 @@
-# Optional: SQL Server backend (FLEET_DB_ENGINE=mssql). Needs Microsoft ODBC Driver 18 installed on the host.
+# SQL Server support is now part of requirements.txt; kept so older install commands still work.
 -r requirements.txt
-mssql-django>=1.5
-pyodbc>=5.1

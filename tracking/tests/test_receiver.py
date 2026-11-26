@@ -9,7 +9,7 @@ from django.conf import settings
 from django.contrib.auth.models import User
 
 from tracking import codec, ingest
-from tracking.models import AVLRecord, Connection, Device, RawPacket
+from tracking.models import AVLRecord, Connection, Device, PortEvent, RawPacket
 from tracking.receiver import Receiver
 from tracking.simulator import DeviceClient, make_record, run_connectivity_suite
 
@@ -153,6 +153,67 @@ class ReceiverTests(TransactionTestCase):
         self.assertEqual(AVLRecord.objects.count(), 0)
         self.assertTrue(RawPacket.objects.filter(parse_status="error", error__contains="not ACKed").exists())
 
+    def wait_events(self, n_min, kind=None, timeout=3):
+        end = time.time() + timeout
+        qs = PortEvent.objects.filter(kind=kind) if kind else PortEvent.objects.all()
+        while time.time() < end and qs.count() < n_min:
+            time.sleep(0.05)
+        return list(qs.order_by("id"))
+
+    def test_port_events_capture_every_byte_in_order(self):
+        c = self.dev_client()
+        self.assertEqual(c.handshake(), 1)
+        frame = codec.encode_frame([make_record(24.39, 54.71, 40, 90)])
+        self.assertEqual(c.send_frame(frame), 1)
+        c.close()
+        events = self.wait_events(7, timeout=4)
+        kinds = [e.kind for e in events]
+        self.assertEqual(kinds[:2], ["connect", "rx"])
+        for k in ("imei", "tx", "frame", "close"):
+            self.assertIn(k, kinds)
+        rx = "".join(e.hex for e in events if e.kind == "rx")
+        handshake = (len(IMEI)).to_bytes(2, "big") + IMEI.encode()
+        self.assertEqual(rx, (handshake + frame).hex().upper())       # every received byte, nothing lost
+        tx = [e.hex for e in events if e.kind == "tx"]
+        self.assertEqual(tx, ["01", "00000001"])                        # handshake accept + ACK 1
+        fr = next(e for e in events if e.kind == "frame")
+        self.assertEqual(fr.level, "ok")
+        self.assertIn("1 record(s), 1 new", fr.message)
+        self.assertEqual(fr.packet_id, RawPacket.objects.get().id)
+        self.assertTrue(all(e.remote.startswith("127.0.0.1:") for e in events))
+
+    def test_port_events_show_non_teltonika_traffic(self):
+        s = socket.create_connection(("127.0.0.1", self.port), timeout=5)
+        s.sendall(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+        try:
+            s.recv(10)
+        except OSError:
+            pass
+        s.close()
+        events = self.wait_events(4, timeout=4)
+        rx = [e for e in events if e.kind == "rx"]
+        self.assertTrue(rx and bytes.fromhex(rx[0].hex).startswith(b"GET / HTTP"))
+        self.assertTrue(any(e.kind == "error" for e in events))
+        self.assertTrue(any(e.kind == "close" for e in events))
+
+    def test_rejected_imei_visible_in_port_events(self):
+        c = self.dev_client("111111111111111")
+        self.assertEqual(c.handshake(), 0)
+        c.close()
+        events = self.wait_events(5, timeout=4)
+        im = next(e for e in events if e.kind == "imei")
+        self.assertEqual((im.level, im.imei), ("warn", "111111111111111"))
+        self.assertIn("00", [e.hex for e in events if e.kind == "tx"])
+
+    @override_settings(FLEET={**settings.FLEET, "AUTO_REGISTER_UNKNOWN": True})
+    def test_commissioning_mode_auto_registers(self):
+        rx = Receiver("127.0.0.1", self.port)  # settings are read at construction; ingest reads them live
+        c = self.dev_client("356307000000999")
+        self.assertEqual(c.handshake(), 1)
+        c.close()
+        self.assertTrue(Device.objects.filter(imei="356307000000999", group="Auto-registered").exists())
+        rx.db.shutdown(wait=False)
+
     def test_full_connectivity_suite(self):
         steps = run_connectivity_suite("127.0.0.1", self.port, IMEI, timeout=5)
         failed = [s for s in steps if not s["ok"]]
@@ -189,3 +250,98 @@ class WebTests(TransactionTestCase):
         csv = c.get("/raw/?export=csv").content.decode()
         self.assertNotIn(IMEI, csv)
         self.assertIn("3563*******1013", csv)
+
+
+class ApiTests(TransactionTestCase):
+    def setUp(self):
+        self.staff = User.objects.create_user("ops", password="pw-12345678", is_staff=True)
+        self.viewer = User.objects.create_user("viewer", password="pw-12345678")
+        self.dev = Device.objects.create(imei=IMEI, name="Bench")
+        conn = Connection.objects.create(device=self.dev, remote="1.2.3.4:5", handshake="accepted")
+        ingest.ingest_frame(conn.id, self.dev.id, IMEI, codec.encode_frame([make_record(24.39, 54.71, 30, 10)]))
+        for i in range(5):
+            ingest.write_event({"kind": "rx", "remote": "1.2.3.4:5", "imei": IMEI, "data": bytes([i, 255])})
+
+    def token(self, user="ops"):
+        r = Client().post("/api/v1/auth/token/", {"username": user, "password": "pw-12345678"},
+                          content_type="application/json")
+        self.assertEqual(r.status_code, 200, r.content)
+        return {"HTTP_AUTHORIZATION": f"Token {r.json()['token']}"}
+
+    def test_token_login_and_bad_password(self):
+        r = Client().post("/api/v1/auth/token/", {"username": "ops", "password": "nope"}, content_type="application/json")
+        self.assertEqual(r.status_code, 401)
+        h = self.token()
+        me = Client().get("/api/v1/auth/me/", **h).json()
+        self.assertEqual((me["username"], me["is_staff"], me["can_view_raw"]), ("ops", True, True))
+        self.assertEqual(Client().delete("/api/v1/auth/token/", **h).status_code, 204)
+        self.assertEqual(Client().get("/api/v1/auth/me/", **h).status_code, 401)
+
+    def test_anonymous_blocked(self):
+        for url in ["/api/v1/devices/", "/api/v1/records/", "/api/v1/packets/", "/api/v1/port-events/",
+                    "/api/v1/receiver/", "/api/schema/"]:
+            self.assertIn(Client().get(url).status_code, (401, 403), url)
+
+    def test_read_endpoints(self):
+        h = self.token()
+        c = Client()
+        devs = c.get("/api/v1/devices/", **h).json()
+        self.assertEqual(devs[0]["imei"], IMEI)
+        self.assertEqual(devs[0]["status"]["state"], "moving")
+        recs = c.get(f"/api/v1/records/?device={self.dev.id}", **h).json()
+        self.assertEqual(recs["count"], 1)
+        rec = c.get(f"/api/v1/records/{recs['results'][0]['id']}/", **h).json()
+        self.assertTrue(any(io["avl_id"] == 239 for io in rec["io"]))
+        pk = RawPacket.objects.get().id
+        pkt = c.get(f"/api/v1/packets/{pk}/", **h).json()
+        self.assertEqual(pkt["decoded"]["codec"], "8E")
+        hist = c.get(f"/api/v1/devices/{self.dev.id}/history/?from=2000-01-01T00:00:00Z", **h).json()
+        self.assertEqual(len(hist), 1)
+        self.assertEqual(c.get("/api/v1/connections/", **h).json()["count"], 1)
+        self.assertEqual(c.get("/api/schema/", **h).status_code, 200)
+        self.assertEqual(c.get("/api/docs/", **h).status_code, 200)
+
+    def test_port_events_tail_after_before_filter(self):
+        h = self.token()
+        c = Client()
+        r = c.get("/api/v1/port-events/?tail=3", **h).json()
+        ids = [e["id"] for e in r["events"]]
+        self.assertEqual(len(ids), 3)
+        self.assertEqual(r["last_id"], ids[-1])
+        self.assertEqual(c.get(f"/api/v1/port-events/?after={ids[-1]}", **h).json()["events"], [])
+        older = c.get(f"/api/v1/port-events/?before={ids[0]}", **h).json()["events"]
+        self.assertEqual(len(older), 2)
+        self.assertEqual(c.get("/api/v1/port-events/?q=03FF", **h).json()["events"][0]["hex"], "03FF")
+        self.assertEqual(c.get("/api/v1/port-events/?kind=tx", **h).json()["events"], [])
+
+    def test_roles(self):
+        h = self.token("viewer")
+        c = Client()
+        self.assertEqual(c.get("/api/v1/port-events/", **h).status_code, 403)
+        self.assertEqual(c.get("/api/v1/packets/", **h).status_code, 403)
+        devs = c.get("/api/v1/devices/", **h).json()
+        self.assertEqual(devs[0]["imei"], "3563*******1013")
+        r = c.post("/api/v1/devices/", {"imei": "356307042441099", "name": "X"}, content_type="application/json", **h)
+        self.assertEqual(r.status_code, 403)
+        hs = self.token()
+        r = c.post("/api/v1/devices/", {"imei": "356307042441099", "name": "X"}, content_type="application/json", **hs)
+        self.assertEqual(r.status_code, 201, r.content)
+        r = c.post("/api/v1/devices/", {"imei": "12ab", "name": "Y"}, content_type="application/json", **hs)
+        self.assertEqual(r.status_code, 400)
+
+    def test_terminal_page_and_web_login_lockout(self):
+        c = Client()
+        c.login(username="ops", password="pw-12345678")
+        page = c.get("/terminal/")
+        self.assertEqual(page.status_code, 200)
+        self.assertContains(page, "Port terminal")
+        self.assertContains(page, 'data-theme-set="dark"')
+        v = Client()
+        v.login(username="viewer", password="pw-12345678")
+        self.assertEqual(v.get("/terminal/").status_code, 302)
+        anon = Client()
+        for _ in range(settings.LOGIN_MAX_FAILURES):
+            anon.post("/login/", {"username": "ops", "password": "wrong"})
+        r = anon.post("/login/", {"username": "ops", "password": "pw-12345678"})
+        self.assertContains(r, "Too many failed sign-in attempts")
+        self.assertNotIn("_auth_user_id", anon.session)

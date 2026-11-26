@@ -152,3 +152,33 @@ class TestRun(models.Model):
 
     class Meta:
         ordering = ["-started_utc"]
+
+
+class PortEvent(models.Model):
+    """
+    Everything that happens on the tracker TCP port, in order: connections, every byte received and
+    sent (HEX), handshakes, decoded frame summaries, ACKs, errors and disconnects. Feeds the live
+    Port terminal page, the /api/v1/port-events/ endpoint and `manage.py port_monitor`.
+    """
+    KINDS = [
+        ("connect", "Connection opened"), ("refused", "Connection refused"), ("rx", "Bytes received"),
+        ("tx", "Bytes sent"), ("imei", "IMEI handshake"), ("frame", "Decoded frame"), ("error", "Error"),
+        ("close", "Connection closed"), ("info", "Receiver info"),
+    ]
+    ts = models.DateTimeField(default=timezone.now, db_index=True)
+    kind = models.CharField(max_length=10, choices=KINDS)
+    level = models.CharField(max_length=8, default="info")  # info | ok | warn | error
+    remote = models.CharField(max_length=80, blank=True, db_index=True)
+    imei = models.CharField(max_length=40, blank=True, db_index=True)
+    connection = models.ForeignKey(Connection, null=True, blank=True, on_delete=models.SET_NULL, related_name="events")
+    packet = models.ForeignKey(RawPacket, null=True, blank=True, on_delete=models.SET_NULL, related_name="events")
+    size = models.PositiveIntegerField(default=0)
+    hex = models.TextField(blank=True)
+    truncated = models.BooleanField(default=False)
+    message = models.CharField(max_length=300, blank=True)
+
+    class Meta:
+        ordering = ["id"]
+
+    def __str__(self):
+        return f"{self.ts:%H:%M:%S} {self.kind} {self.remote} {self.message}"

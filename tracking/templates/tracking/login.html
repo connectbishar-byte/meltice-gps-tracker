@@ -1,18 +1,29 @@
 {% extends "tracking/base.html" %}
+{% block title %}Sign in · {{ FLEET.SITE_NAME }}{% endblock %}
 {% block bodyclass %}login{% endblock %}
 {% block mainclass %}{% endblock %}
 {% block content %}
+<div class="dropdown login-theme">
+  <button class="btn btn-sm btn-outline-light theme-btn" data-bs-toggle="dropdown" aria-expanded="false" aria-label="Colour theme"><i class="bi bi-circle-half" data-theme-icon></i></button>
+  <ul class="dropdown-menu dropdown-menu-end">
+    <li><button class="dropdown-item" data-theme-set="light"><i class="bi bi-sun me-2"></i>Light</button></li>
+    <li><button class="dropdown-item" data-theme-set="dark"><i class="bi bi-moon-stars me-2"></i>Dark</button></li>
+    <li><button class="dropdown-item" data-theme-set="auto"><i class="bi bi-circle-half me-2"></i>Match system</button></li>
+  </ul>
+</div>
 <div class="login-wrap">
-  <div class="card p-4" style="width: 360px">
+  <div class="card p-4" style="width: 360px; max-width: calc(100vw - 32px)">
     <div class="text-center mb-3">
       <i class="bi bi-geo-alt-fill" style="font-size: 40px; color: var(--accent)"></i>
       <h4 class="mb-0">{{ FLEET.SITE_NAME }}</h4>
-      <div class="text-muted small">Vehicle tracking prototype · {{ FLEET.ENVIRONMENT }}</div>
+      <div class="text-body-secondary small">Connectivity and raw data · {{ FLEET.ENVIRONMENT }}</div>
     </div>
     <form method="post">{% csrf_token %}
-      {% if form.errors %}<div class="alert alert-danger py-2">Invalid username or password.</div>{% endif %}
-      <div class="mb-2"><label class="form-label small">Username</label><input class="form-control" name="username" autofocus required></div>
-      <div class="mb-3"><label class="form-label small">Password</label><input class="form-control" type="password" name="password" required></div>
+      <input type="hidden" name="next" value="{{ next }}">
+      {% if locked %}<div class="alert alert-warning py-2 small">Too many failed sign-in attempts. Try again in {{ lockout_minutes }} minutes.</div>
+      {% elif form.errors %}<div class="alert alert-danger py-2 small">Invalid username or password.</div>{% endif %}
+      <div class="mb-2"><label class="form-label small" for="id_username">Username</label><input class="form-control" id="id_username" name="username" autocomplete="username" autocapitalize="none" value="{{ form.username.value|default:'' }}" autofocus required></div>
+      <div class="mb-3"><label class="form-label small" for="id_password">Password</label><input class="form-control" type="password" id="id_password" name="password" autocomplete="current-password" required></div>
       <button class="btn btn-primary w-100" style="background: var(--accent); border-color: var(--accent)">Sign in</button>
     </form>
   </div>

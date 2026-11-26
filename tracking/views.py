@@ -6,7 +6,10 @@ from datetime import timedelta
 from django import forms
 from django.conf import settings
 from django.contrib import messages
+from django.contrib.auth import views as auth_views
 from django.contrib.auth.decorators import login_required, user_passes_test
+from django.core.cache import cache
+from django.urls import reverse_lazy
 from django.core.paginator import Paginator
 from django.db.models import Count, Q
 from django.http import HttpResponse, JsonResponse
@@ -86,6 +89,63 @@ def receiver_status():
 
 
 # ---------------------------------------------------------------------------
+# Authentication
+# ---------------------------------------------------------------------------
+def _client_ip(request) -> str:
+    if settings.FLEET_TRUST_X_FORWARDED_FOR:
+        real = request.META.get("HTTP_X_REAL_IP", "").strip()  # set by our Nginx site, not spoofable through it
+        if real:
+            return real
+    return request.META.get("REMOTE_ADDR", "")
+
+
+class ThrottledLoginView(auth_views.LoginView):
+    """Username + password sign-in with a lockout after repeated failures (per username and per IP)."""
+    template_name = "tracking/login.html"
+    redirect_authenticated_user = True
+
+    def _keys(self):
+        user = (self.request.POST.get("username") or "").strip().lower()[:150]
+        ip = _client_ip(self.request)
+        return [f"login-fail:user:{user}", f"login-fail:ip:{ip}"]
+
+    def post(self, request, *args, **kwargs):
+        limit = settings.LOGIN_MAX_FAILURES
+        if any((cache.get(k) or 0) >= limit * (3 if ":ip:" in k else 1) for k in self._keys()):
+            form = self.get_form()
+            form.errors.clear()
+            return self.render_to_response(self.get_context_data(
+                form=form, locked=True, lockout_minutes=settings.LOGIN_LOCKOUT_MINUTES))
+        return super().post(request, *args, **kwargs)
+
+    def form_invalid(self, form):
+        ttl = settings.LOGIN_LOCKOUT_MINUTES * 60
+        for k in self._keys():
+            try:
+                cache.add(k, 0, ttl)
+                cache.incr(k)
+            except ValueError:
+                cache.set(k, 1, ttl)
+        return super().form_invalid(form)
+
+    def form_valid(self, form):
+        cache.delete_many(self._keys()[:1])
+        return super().form_valid(form)
+
+
+class PasswordChange(auth_views.PasswordChangeView):
+    template_name = "tracking/password_change.html"
+    success_url = reverse_lazy("dashboard")
+
+    def get_context_data(self, **kwargs):
+        return super().get_context_data(**kwargs) | {"nav": "account"}
+
+    def form_valid(self, form):
+        messages.success(self.request, "Password changed.")
+        return super().form_valid(form)
+
+
+# ---------------------------------------------------------------------------
 # Pages
 # ---------------------------------------------------------------------------
 @login_required
@@ -109,6 +169,19 @@ def dashboard(request):
 
 
 @login_required
+@raw_required
+def terminal(request):
+    cfg = settings.FLEET
+    return render(request, "tracking/terminal.html", {
+        "nav": "terminal", "receiver": receiver_status(),
+        "public_endpoint": f"{cfg['PUBLIC_GPS_HOST']}:{cfg['PUBLIC_GPS_PORT']}",
+        "bind": f"{cfg['RECEIVER_BIND_HOST']}:{cfg['RECEIVER_PORT']}",
+        "poll_ms": cfg["TERMINAL_POLL_MS"], "port_log": cfg["PORT_LOG"],
+        "retention_h": cfg["PORT_LOG_RETENTION_HOURS"], "auto_register": cfg["AUTO_REGISTER_UNKNOWN"],
+    })
+
+
+@login_required
 def live(request):
     return render(request, "tracking/live.html", {"nav": "live"})
 
@@ -121,7 +194,7 @@ def history(request):
 
 @login_required
 def records(request):
-    qs = AVLRecord.objects.select_related("device").annotate(io_count=Count("io"))
+    qs = AVLRecord.objects.select_related("device").annotate(io_count=Count("io")).order_by("-timestamp_utc", "-id")
     dev = request.GET.get("device")
     if dev:
         qs = qs.filter(device_id=dev)

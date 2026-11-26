@@ -1,0 +1,57 @@
+{% extends "tracking/base.html" %}
+{% load static %}
+{% block title %}Port terminal · {{ FLEET.SITE_NAME }}{% endblock %}
+{% block mainclass %}content-flush{% endblock %}
+{% block content %}
+<div class="term-page">
+  <div class="term-head">
+    <div class="d-flex flex-wrap align-items-baseline justify-content-between gap-2">
+      <h5 class="mb-1">Port terminal</h5>
+      <div class="term-status">
+        <span><span class="live-dot" id="tLive"></span><span id="tRx">{% if receiver.up %}Receiver listening{% else %}Receiver not running{% endif %}</span></span>
+        <span><span class="k">Listening on</span> <code>{{ bind }}</code></span>
+        <span><span class="k">Devices connect to</span> <code>{{ public_endpoint }}</code> · TCP</span>
+        <span><span class="k">Open connections</span> <b id="tActive">{{ receiver.active|default:0 }}</b></span>
+      </div>
+    </div>
+    <p class="small text-body-secondary mb-2">Everything that reaches the tracker port, live: every connection, every byte received
+      (<b>RX</b>) and sent (<b>TX</b>) as HEX, the IMEI handshake, each decoded frame and its ACK, errors and disconnects.
+      Click a line for the full hex dump. Kept for {{ retention_h }} hours.
+      {% if not port_log %}<span class="text-danger">Port logging is switched off (FLEET_PORT_LOG=false), so nothing new will appear.</span>{% endif %}
+      {% if auto_register %}<span class="text-warning-emphasis">Commissioning mode is on: any IMEI is accepted and auto-registered.</span>{% endif %}</p>
+  </div>
+  <div class="term-bar" role="toolbar" aria-label="Terminal controls">
+    <input class="form-control form-control-sm" id="tFilter" type="search" placeholder="Filter: IMEI, IP or text" aria-label="Filter" style="min-width: 220px">
+    <div class="btn-group btn-group-sm kinds" role="group" aria-label="Event types">
+      <button class="btn btn-outline-secondary active" data-kind="conn" aria-pressed="true">Connections</button>
+      <button class="btn btn-outline-secondary active" data-kind="rx" aria-pressed="true">RX</button>
+      <button class="btn btn-outline-secondary active" data-kind="tx" aria-pressed="true">TX</button>
+      <button class="btn btn-outline-secondary active" data-kind="frame" aria-pressed="true">Decoded</button>
+      <button class="btn btn-outline-secondary active" data-kind="error" aria-pressed="true">Errors</button>
+    </div>
+    <select class="form-select form-select-sm" id="tFormat" aria-label="Byte format">
+      <option value="hex">HEX</option>
+      <option value="spaced">HEX (spaced)</option>
+      <option value="both">HEX + ASCII</option>
+    </select>
+    <div class="form-check form-switch m-0 small">
+      <input class="form-check-input" type="checkbox" id="tFollow" checked>
+      <label class="form-check-label" for="tFollow">Auto-scroll</label>
+    </div>
+    <span class="spacer"></span>
+    <button class="btn btn-sm btn-outline-secondary" id="tOlder" title="Load older events"><i class="bi bi-arrow-up"></i> Older</button>
+    <button class="btn btn-sm btn-outline-secondary" id="tPause" aria-pressed="false"><i class="bi bi-pause-fill"></i> Pause</button>
+    <button class="btn btn-sm btn-outline-secondary" id="tClear" title="Clear the screen (data stays stored)"><i class="bi bi-eraser"></i> Clear</button>
+    <button class="btn btn-sm btn-outline-secondary" id="tSave" title="Download what is on screen"><i class="bi bi-download"></i> Save .log</button>
+  </div>
+  <div class="term" id="term" tabindex="0" aria-live="off" aria-label="Port event stream">
+    <div class="term-empty" id="tEmpty">Waiting for data on port {{ FLEET.RECEIVER_PORT }}…
+      Point a device at <code>{{ public_endpoint }}</code>, or run <code>python manage.py simulate_device</code> / <code>python tools/fmc_probe.py {{ FLEET.PUBLIC_GPS_HOST }} {{ FLEET.PUBLIC_GPS_PORT }}</code> to send test traffic.</div>
+  </div>
+  <div class="term-foot"><span id="tCount">0 events</span><span id="tState">connecting…</span></div>
+</div>
+{% endblock %}
+{% block scripts %}
+<script>window.TERM_CFG = {api: "{% url 'api_port_events' %}", poll: {{ poll_ms }}, raw: "{% url 'raw' %}"};</script>
+<script src="{% static 'tracking/terminal.js' %}"></script>
+{% endblock %}

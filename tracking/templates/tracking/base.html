@@ -1,7 +1,17 @@
 {% load static %}<!doctype html>
-<html lang="en">
+<html lang="en" data-bs-theme="light">
 <head>
 <meta charset="utf-8">
+<script>
+/* Apply the saved theme before anything paints (no white flash in dark mode). */
+(function () {
+  var pref = "auto";
+  try { pref = localStorage.getItem("mgt-theme") || "auto"; } catch (e) {}
+  var dark = pref === "dark" || (pref === "auto" && window.matchMedia && matchMedia("(prefers-color-scheme: dark)").matches);
+  document.documentElement.setAttribute("data-bs-theme", dark ? "dark" : "light");
+  document.documentElement.dataset.themePref = pref;
+})();
+</script>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{% block title %}{{ FLEET.SITE_NAME }}{% endblock %}</title>
 <link rel="stylesheet" href="{% static 'vendor/bootstrap/bootstrap.min.css' %}">
@@ -20,6 +30,7 @@
     <a href="{% url 'records' %}" class="{% if nav == 'records' %}active{% endif %}"><i class="bi bi-table"></i><span>Records</span></a>
     {% if can_view_raw %}<a href="{% url 'raw' %}" class="{% if nav == 'raw' %}active{% endif %}"><i class="bi bi-file-binary"></i><span>Raw data</span></a>{% endif %}
     <a href="{% url 'devices' %}" class="{% if nav == 'devices' %}active{% endif %}"><i class="bi bi-cpu"></i><span>Devices</span></a>
+    {% if can_view_raw %}<a href="{% url 'terminal' %}" class="{% if nav == 'terminal' %}active{% endif %}"><i class="bi bi-terminal"></i><span>Port terminal</span></a>{% endif %}
     <a href="{% url 'connectivity' %}" class="{% if nav == 'connectivity' %}active{% endif %}"><i class="bi bi-activity"></i><span>Connectivity</span></a>
     <a href="{% url 'settings' %}" class="{% if nav == 'settings' %}active{% endif %}"><i class="bi bi-sliders"></i><span>Settings</span></a>
   </nav>
@@ -33,9 +44,30 @@
     </div>
     <div class="d-flex align-items-center gap-3">
       <span class="rx-pill" id="rxPill" title="TCP receiver status"><i class="bi bi-circle-fill"></i> Receiver</span>
+      <div class="dropdown">
+        <button class="btn btn-sm btn-outline-light theme-btn" data-bs-toggle="dropdown" aria-expanded="false" aria-label="Colour theme" title="Colour theme">
+          <i class="bi bi-circle-half" data-theme-icon></i>
+        </button>
+        <ul class="dropdown-menu dropdown-menu-end">
+          <li><button class="dropdown-item" data-theme-set="light"><i class="bi bi-sun me-2"></i>Light</button></li>
+          <li><button class="dropdown-item" data-theme-set="dark"><i class="bi bi-moon-stars me-2"></i>Dark</button></li>
+          <li><button class="dropdown-item" data-theme-set="auto"><i class="bi bi-circle-half me-2"></i>Match system</button></li>
+        </ul>
+      </div>
       {% if user.is_authenticated %}
-      <span class="small text-white-50"><i class="bi bi-person-circle"></i> {{ user.username }}</span>
-      <form method="post" action="{% url 'logout' %}" class="m-0">{% csrf_token %}<button class="btn btn-sm btn-outline-light">Sign out</button></form>
+      <div class="dropdown">
+        <button class="btn btn-sm btn-outline-light dropdown-toggle" data-bs-toggle="dropdown" aria-expanded="false">
+          <i class="bi bi-person-circle"></i> <span class="d-none d-sm-inline">{{ user.username }}</span>
+        </button>
+        <ul class="dropdown-menu dropdown-menu-end">
+          <li><span class="dropdown-item-text small text-body-secondary">{% if user.is_superuser %}Administrator{% elif user.is_staff %}Staff{% elif can_view_raw %}Raw-data viewer{% else %}Viewer{% endif %}</span></li>
+          <li><a class="dropdown-item" href="{% url 'password_change' %}"><i class="bi bi-key me-2"></i>Change password</a></li>
+          <li><a class="dropdown-item" href="{% url 'api_docs' %}"><i class="bi bi-braces me-2"></i>REST API docs</a></li>
+          {% if user.is_superuser %}<li><a class="dropdown-item" href="{% url 'admin:auth_user_changelist' %}"><i class="bi bi-people me-2"></i>Manage users</a></li>{% endif %}
+          <li><hr class="dropdown-divider"></li>
+          <li><form method="post" action="{% url 'logout' %}" class="m-0">{% csrf_token %}<button class="dropdown-item"><i class="bi bi-box-arrow-right me-2"></i>Sign out</button></form></li>
+        </ul>
+      </div>
       {% endif %}
     </div>
   </header>

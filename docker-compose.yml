@@ -1,32 +1,62 @@
-# Local hosting: web UI on http://127.0.0.1:8000 and Teltonika TCP receiver on port 5027.
-#   cp .env.example .env   (edit passwords)
+# Local hosting: SQL Server 2022 + web UI on http://127.0.0.1:8000 + Teltonika TCP receiver on port 5027.
+#   cp .env.example .env        (set the passwords marked change-me)
 #   docker compose up -d --build
-#   docker compose --profile sim up -d simulator     # optional simulated vehicles
+#   docker compose logs -f receiver                     # receiver log
+#   docker compose exec web python manage.py port_monitor   # live port terminal in your shell
+#   docker compose --profile sim up -d simulator         # optional simulated vehicles
 services:
+  db:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_PID: ${MSSQL_PID:-Express}              # Express is free for production use (10 GB per database)
+      MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD:?set MSSQL_SA_PASSWORD in .env}
+    ports: ["127.0.0.1:1433:1433"]                  # reachable from this PC only (SSMS / Azure Data Studio)
+    volumes: [mssqldata:/var/opt/mssql]             # backups: /var/opt/mssql/backup (docker compose cp db:/var/opt/mssql/backup ./backups)
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -P \"$$MSSQL_SA_PASSWORD\" -Q 'SELECT 1' -b -o /dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
   web:
     build: .
     command: ["web"]
     env_file: [.env]
     environment:
-      FLEET_SELFTEST_HOST: receiver          # web self-test reaches the receiver container
+      FLEET_DB_ENGINE: mssql
+      FLEET_DB_HOST: db
+      FLEET_DB_PORT: "1433"
+      FLEET_DB_ADMIN_USER: sa
+      FLEET_DB_ADMIN_PASSWORD: ${MSSQL_SA_PASSWORD}  # only used to create the database and app login
+      FLEET_SELFTEST_HOST: receiver                  # web self-test reaches the receiver container
       FLEET_ALLOWED_HOSTS: ${FLEET_ALLOWED_HOSTS:-127.0.0.1,localhost}
-    ports: ["127.0.0.1:8000:8000"]           # web stays on loopback
+    ports: ["127.0.0.1:8000:8000"]                   # web stays on loopback
     volumes: [fleetdata:/data]
+    depends_on:
+      db: {condition: service_healthy}
     restart: unless-stopped
-    healthcheck:    # healthy once migrations (+ optional demo seed) are done and gunicorn answers
+    healthcheck:    # healthy once the database, migrations (+ optional demo seed) are done and gunicorn answers
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/login/', timeout=3)"]
       interval: 10s
       timeout: 5s
-      retries: 12
-      start_period: 20s
+      retries: 18
+      start_period: 30s
 
   receiver:
     build: .
     command: ["receiver"]
     env_file: [.env]
-    ports: ["5027:5027"]                       # raw TCP for the tracker (independent of HTTP)
+    environment:
+      FLEET_DB_ENGINE: mssql
+      FLEET_DB_HOST: db
+      FLEET_DB_PORT: "1433"
+    ports: ["5027:5027"]                              # raw TCP for the tracker (independent of HTTP)
     volumes: [fleetdata:/data]
-    depends_on: [web]
+    depends_on:
+      web: {condition: service_healthy}
     restart: unless-stopped
 
   simulator:
@@ -35,6 +65,9 @@ services:
     command: ["sim", "--host", "receiver", "--port", "5027",
               "--imei", "356307042441013,356307042441021,356307042441054", "--interval", "5"]
     env_file: [.env]
+    environment:
+      FLEET_DB_ENGINE: mssql
+      FLEET_DB_HOST: db
     volumes: [fleetdata:/data]
     depends_on:
       web: {condition: service_healthy}
@@ -43,3 +76,4 @@ services:
 
 volumes:
   fleetdata:
+  mssqldata:
